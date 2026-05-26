@@ -1,0 +1,6 @@
+.env
+bot.db
+*.db
+__pycache__/
+.venv/
+.idea/workspace.xml
