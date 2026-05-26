@@ -52,6 +52,8 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "XTR")
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN")
+REFERRAL_REWARD_SLOTS = int(os.getenv("REFERRAL_REWARD_SLOTS", "1"))
+REFERRAL_MAX_BONUS_SLOTS = int(os.getenv("REFERRAL_MAX_BONUS_SLOTS", "10"))
 ADMIN_IDS = {
     int(admin_id.strip())
     for admin_id in os.getenv("ADMIN_IDS", "").split(",")
@@ -59,6 +61,25 @@ ADMIN_IDS = {
 }
 
 DB_LOCK = threading.Lock()
+
+
+def parse_promo_codes(raw_codes):
+    """Parse CODE:plan:days,CODE2:plan:days into a promo config dict."""
+    promo_codes = {}
+    for item in raw_codes.split(","):
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) != 3:
+            continue
+        code, plan_id, days = parts
+        if not code or not days.isdigit():
+            continue
+        promo_codes[code.upper()] = {"plan": plan_id, "days": int(days)}
+    return promo_codes
+
+
+PROMO_CODES = parse_promo_codes(
+    os.getenv("PROMO_CODES", "LAUNCH7:premium:7,STUDENT7:premium:7,PARTNER7:premium:7")
+)
 
 PLAN_CONFIG = {
     "free": {
@@ -73,14 +94,14 @@ PLAN_CONFIG = {
         "limit": 15,
         "days": 30,
         "price": int(os.getenv("PREMIUM_PRICE_STARS", "199")),
-        "description": "30 товарів на 30 днів",
+        "description": "15 товарів на 30 днів",
     },
     "business": {
         "name": "Business",
         "limit": 30,
         "days": 30,
         "price": int(os.getenv("BUSINESS_PRICE_STARS", "499")),
-        "description": "100 товарів на 30 днів",
+        "description": "30 товарів на 30 днів",
     },
 }
 
@@ -93,7 +114,7 @@ SHOPS_DATA = {
         "name": "💻 Електроніка",
         "items": {
             "rozetka": "Rozetka",
-            "ekatalog": "e-Katalog (ek.ua)",
+            "ekatalog": "e-Katalog",
             "moyo": "Moyo.ua",
         },
     },
@@ -133,6 +154,12 @@ def db_connect():
     return conn
 
 
+def ensure_column(conn, table, column, definition):
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     with DB_LOCK, db_connect() as conn:
         conn.execute(
@@ -141,10 +168,14 @@ def init_db():
                 chat_id INTEGER PRIMARY KEY,
                 plan TEXT NOT NULL DEFAULT 'free',
                 premium_until TEXT,
+                referral_bonus_slots INTEGER NOT NULL DEFAULT 0,
+                referred_by INTEGER,
                 created_at TEXT NOT NULL
             )
             """
         )
+        ensure_column(conn, "users", "referral_bonus_slots", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "users", "referred_by", "INTEGER")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS monitors (
@@ -173,17 +204,42 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_chat_id INTEGER NOT NULL,
+                referred_chat_id INTEGER NOT NULL UNIQUE,
+                reward_slots INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promo_redemptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                plan TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, code)
+            )
+            """
+        )
 
 
 def ensure_user(chat_id):
     with DB_LOCK, db_connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
-            INSERT OR IGNORE INTO users (chat_id, plan, premium_until, created_at)
-            VALUES (?, 'free', NULL, ?)
+            INSERT OR IGNORE INTO users (chat_id, plan, premium_until, referral_bonus_slots, referred_by, created_at)
+            VALUES (?, 'free', NULL, 0, NULL, ?)
             """,
             (chat_id, to_iso(utc_now())),
         )
+    return cursor.rowcount == 1
 
 
 def get_user(chat_id):
@@ -210,7 +266,64 @@ def get_effective_plan(chat_id):
 
 
 def get_plan_limit(chat_id):
-    return PLAN_CONFIG[get_effective_plan(chat_id)]["limit"]
+    user = get_user(chat_id)
+    base_limit = PLAN_CONFIG[get_effective_plan(chat_id)]["limit"]
+    return base_limit + user["referral_bonus_slots"]
+
+
+def register_referral(new_chat_id, referrer_chat_id):
+    if new_chat_id == referrer_chat_id:
+        return False
+
+    ensure_user(referrer_chat_id)
+    with DB_LOCK, db_connect() as conn:
+        existing = conn.execute(
+            "SELECT referred_by FROM users WHERE chat_id = ?",
+            (new_chat_id,),
+        ).fetchone()
+        if not existing or existing["referred_by"] is not None:
+            return False
+
+        current_bonus = conn.execute(
+            "SELECT referral_bonus_slots FROM users WHERE chat_id = ?",
+            (referrer_chat_id,),
+        ).fetchone()["referral_bonus_slots"]
+        if current_bonus >= REFERRAL_MAX_BONUS_SLOTS:
+            reward_slots = 0
+        else:
+            reward_slots = min(REFERRAL_REWARD_SLOTS, REFERRAL_MAX_BONUS_SLOTS - current_bonus)
+
+        conn.execute(
+            "UPDATE users SET referred_by = ? WHERE chat_id = ?",
+            (referrer_chat_id, new_chat_id),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO referrals (referrer_chat_id, referred_chat_id, reward_slots, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (referrer_chat_id, new_chat_id, reward_slots, to_iso(utc_now())),
+        )
+        if reward_slots:
+            conn.execute(
+                """
+                UPDATE users
+                SET referral_bonus_slots = referral_bonus_slots + ?
+                WHERE chat_id = ?
+                """,
+                (reward_slots, referrer_chat_id),
+            )
+    return reward_slots > 0
+
+
+def get_referral_stats(chat_id):
+    user = get_user(chat_id)
+    with DB_LOCK, db_connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM referrals WHERE referrer_chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    return row["total"], user["referral_bonus_slots"]
 
 
 def count_monitors(chat_id):
@@ -277,6 +390,48 @@ def activate_plan(chat_id, plan_id):
             (plan_id, to_iso(premium_until), chat_id),
         )
     return premium_until
+
+
+def activate_custom_plan(chat_id, plan_id, days):
+    current_user = get_user(chat_id)
+    current_until = from_iso(current_user["premium_until"])
+    start_at = current_until if current_until and current_until > utc_now() else utc_now()
+    premium_until = start_at + timedelta(days=days)
+
+    with DB_LOCK, db_connect() as conn:
+        conn.execute(
+            "UPDATE users SET plan = ?, premium_until = ? WHERE chat_id = ?",
+            (plan_id, to_iso(premium_until), chat_id),
+        )
+    return premium_until
+
+
+def redeem_promo_code(chat_id, code):
+    code = code.strip().upper()
+    promo = PROMO_CODES.get(code)
+    if not promo:
+        return None, "unknown"
+    if promo["plan"] not in PLAN_CONFIG or promo["plan"] == "free":
+        return None, "invalid"
+
+    ensure_user(chat_id)
+    with DB_LOCK, db_connect() as conn:
+        already_used = conn.execute(
+            "SELECT id FROM promo_redemptions WHERE chat_id = ? AND code = ?",
+            (chat_id, code),
+        ).fetchone()
+        if already_used:
+            return None, "used"
+        conn.execute(
+            """
+            INSERT INTO promo_redemptions (chat_id, code, plan, days, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (chat_id, code, promo["plan"], promo["days"], to_iso(utc_now())),
+        )
+
+    premium_until = activate_custom_plan(chat_id, promo["plan"], promo["days"])
+    return premium_until, promo
 
 
 def create_payment(chat_id, plan_id, payload):
@@ -470,6 +625,7 @@ def build_main_menu():
         types.KeyboardButton("📋 Мої товари"),
         types.KeyboardButton("🗂 Вибрати магазин вручну"),
         types.KeyboardButton("⭐ Плани"),
+        types.KeyboardButton("🎁 Запросити друга"),
     )
     return main_markup
 
@@ -499,7 +655,9 @@ def plan_status_text(chat_id):
 
     return (
         f"Ваш план: **{plan['name']}**\n"
-        f"Ліміт товарів: **{plan['limit']}**\n"
+        f"Базовий ліміт: **{plan['limit']}**\n"
+        f"Бонус за друзів: **+{user['referral_bonus_slots']}**\n"
+        f"Загальний ліміт: **{get_plan_limit(chat_id)}**\n"
         f"Зараз додано: **{count_monitors(chat_id)}**{expires}"
     )
 
@@ -524,6 +682,34 @@ def send_upgrade_hint(chat_id):
     )
 
 
+def send_referral_info(chat_id):
+    referrals_count, bonus_slots = get_referral_stats(chat_id)
+    bot_info = bot.get_me()
+    referral_link = f"https://t.me/{bot_info.username}?start=ref_{chat_id}"
+    text = (
+        "🎁 **Запросіть друзів і отримайте більше місць**\n\n"
+        f"За кожного друга: **+{REFERRAL_REWARD_SLOTS} товар**\n"
+        f"Максимальний бонус: **+{REFERRAL_MAX_BONUS_SLOTS} товарів**\n\n"
+        f"Запрошено друзів: **{referrals_count}**\n"
+        f"Ваш бонус зараз: **+{bonus_slots}**\n\n"
+        f"Ваше посилання:\n`{referral_link}`"
+    )
+    bot.send_message(chat_id, text, parse_mode="Markdown", disable_web_page_preview=True)
+
+
+def send_promo_help(chat_id):
+    bot.send_message(
+        chat_id,
+        "🎟 Маєте промокод від каналу або партнера?\n\n"
+        "Введіть його так:\n"
+        "`/promo STUDENT7`\n\n"
+        "Або відкрийте партнерське посилання виду:\n"
+        "`https://t.me/your_bot?start=promo_STUDENT7`",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
 # ==========================================
 # ОБРОБНИКИ КОМАНД ТА КЛАВІАТУРИ TELEGRAM
 # ==========================================
@@ -531,7 +717,32 @@ def send_upgrade_hint(chat_id):
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
     """Команда /start або /help — створює головне меню кнопок."""
-    ensure_user(message.chat.id)
+    is_new_user = ensure_user(message.chat.id)
+    parts = message.text.split(maxsplit=1)
+    start_payload = parts[1].strip() if len(parts) > 1 else ""
+
+    if is_new_user and start_payload.startswith("ref_"):
+        referrer_value = start_payload.replace("ref_", "", 1)
+        if referrer_value.isdigit() and register_referral(message.chat.id, int(referrer_value)):
+            try:
+                bot.send_message(
+                    int(referrer_value),
+                    f"🎁 Новий користувач приєднався за вашим посиланням. Ви отримали +{REFERRAL_REWARD_SLOTS} слот!",
+                )
+            except Exception as e:
+                print(f"Не вдалося повідомити реферера {referrer_value}: {e}")
+
+    if start_payload.startswith("promo_"):
+        code = start_payload.replace("promo_", "", 1)
+        premium_until, promo = redeem_promo_code(message.chat.id, code)
+        if promo not in ["unknown", "used", "invalid"]:
+            bot.send_message(
+                message.chat.id,
+                f"🎟 Промокод активовано! План **{PLAN_CONFIG[promo['plan']]['name']}** діє до "
+                f"{premium_until.strftime('%Y-%m-%d')}.",
+                parse_mode="Markdown",
+            )
+
     text = (
         "👋 **Привіт! Я бот для відстежування цін на товари.**\n\n"
         "🚀 **Як користуватися:**\n"
@@ -542,7 +753,7 @@ def send_welcome(message):
     bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=build_main_menu())
 
 
-@bot.message_handler(func=lambda message: message.text in ["📋 Мої товари", "🗂 Вибрати магазин вручну", "⭐ Плани"])
+@bot.message_handler(func=lambda message: message.text in ["📋 Мої товари", "🗂 Вибрати магазин вручну", "⭐ Плани", "🎁 Запросити друга"])
 def handle_reply_keyboard(message):
     """Обробка великих кнопок нижнього меню."""
     if message.text == "📋 Мої товари":
@@ -551,12 +762,48 @@ def handle_reply_keyboard(message):
         show_categories(message)
     elif message.text == "⭐ Плани":
         send_plans(message.chat.id)
+    elif message.text == "🎁 Запросити друга":
+        send_referral_info(message.chat.id)
 
 
 @bot.message_handler(commands=["plans", "upgrade"])
 def plans_command(message):
     ensure_user(message.chat.id)
     send_plans(message.chat.id)
+
+
+@bot.message_handler(commands=["referral", "invite"])
+def referral_command(message):
+    ensure_user(message.chat.id)
+    send_referral_info(message.chat.id)
+
+
+@bot.message_handler(commands=["promo"])
+def promo_command(message):
+    ensure_user(message.chat.id)
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 1:
+        send_promo_help(message.chat.id)
+        return
+
+    code = parts[1].strip()
+    premium_until, result = redeem_promo_code(message.chat.id, code)
+    if result == "unknown":
+        bot.send_message(message.chat.id, "❌ Такого промокоду немає або він уже неактивний.")
+        return
+    if result == "used":
+        bot.send_message(message.chat.id, "ℹ️ Ви вже використали цей промокод.")
+        return
+    if result == "invalid":
+        bot.send_message(message.chat.id, "❌ Цей промокод налаштований некоректно.")
+        return
+
+    bot.send_message(
+        message.chat.id,
+        f"🎟 Промокод активовано! План **{PLAN_CONFIG[result['plan']]['name']}** діє до "
+        f"{premium_until.strftime('%Y-%m-%d')}.",
+        parse_mode="Markdown",
+    )
 
 
 @bot.message_handler(commands=["subscription"])
@@ -926,6 +1173,8 @@ if __name__ == "__main__":
             telebot.types.BotCommand("/track", "🗂 Вибрати магазин вручну"),
             telebot.types.BotCommand("/plans", "⭐ Плани та оплата"),
             telebot.types.BotCommand("/subscription", "👤 Мій тариф"),
+            telebot.types.BotCommand("/referral", "🎁 Моє реферальне посилання"),
+            telebot.types.BotCommand("/promo", "🎟 Активувати промокод"),
             telebot.types.BotCommand("/help", "❓ Як користуватися ботом"),
         ]
     )

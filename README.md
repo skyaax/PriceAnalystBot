@@ -12,6 +12,58 @@ The bot uses a freemium model:
 
 Users can open `/plans` or `/upgrade`, pick a plan, and pay through Telegram invoices. The default currency is Telegram Stars (`XTR`), which is the best fit for digital bot features.
 
+## Referrals
+
+Users can open `/referral` to get a personal invite link.
+
+Each invited friend gives the referrer extra product slots:
+
+- `REFERRAL_REWARD_SLOTS=1`
+- `REFERRAL_MAX_BONUS_SLOTS=10`
+
+Example link format:
+
+```text
+https://t.me/your_bot_username?start=ref_123456789
+```
+
+The bot creates the real link automatically, so users do not need to type it themselves.
+
+## Promo codes for channel partners
+
+Promo codes are useful when a Telegram channel owner promotes your bot.
+
+Set codes in `.env`:
+
+```env
+PROMO_CODES=STUDENT7:premium:7,CHANNEL7:premium:7,BEAUTY7:premium:7
+```
+
+Format:
+
+```text
+CODE:plan:days
+```
+
+Users can redeem:
+
+```text
+/promo STUDENT7
+```
+
+Or you can give a channel owner a direct promo link:
+
+```text
+https://t.me/your_bot_username?start=promo_STUDENT7
+```
+
+Simple partner deal:
+
+```text
+Post this bot with your promo link. Your audience gets 7 days Premium.
+If 20+ users activate it, I can give you a revenue share or fixed payment.
+```
+
 You can also manually grant a plan while testing:
 
 ```bash
